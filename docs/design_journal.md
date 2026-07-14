@@ -247,6 +247,98 @@ Phase 4 完成後，知識庫結構已確定。Phase 5 的重點是設計 AI Age
 ---
 ---
 
+# Phase 5：AI Agent Design
+
+## ① Requirement & Discovery
+
+**這個階段要解決什麼問題？**
+
+Phase 1-4 完成了「做什麼」（PRD、Conversation Design、Architecture、Knowledge Base），Phase 5 要定義「怎麼做」——AI 的行為規格。
+
+在 Phase 4 結束後，知識庫已建立，但 AI 還不知道：
+- 如何判斷用戶想要什麼（意圖分類）
+- 判斷出意圖後，要怎麼回答（RAG / API / Workflow）
+- 什麼情況下不該回答（Safety Guard）
+- 掛失流程的每個步驟說什麼
+
+這些設計如果不事先寫清楚，實作時就會每個問題都需要「現場決定」，品質不一致。
+
+**這個階段的核心輸出：**
+把 Phase 1-3 的需求，翻譯成 AI 可以執行的 Prompt 規格，讓 Sprint 實作時有明確依據。
+
+## ② Design Decision
+
+**決定一：Intent Classifier 獨立於主對話**
+
+意圖分類使用獨立的 LLM 呼叫，輸出結構化 JSON，而非讓主對話 AI 在回答中「暗示」意圖。
+
+理由：
+- 分類結果機器可解析，不依賴文字解讀
+- 可單獨測試分類準確率（建立 30 個測試案例，目標 > 90%）
+- 未來可替換為更快的小模型，不影響主對話品質
+
+**決定二：Safety Guard 分三層，最高優先級硬編碼**
+
+非財務問題：Intent-level 攔截（不送 LLM，直接返回拒絕訊息）
+財務 Disclaimer：程式碼層強制插入（不依賴 AI 自行判斷何時加）
+詐騙情境警告：完全繞過 LLM，返回硬編碼的標準化警告
+
+這個設計的面試說法：「最高風險的邊界由程式碼控制，而非 AI 判斷」。
+
+**決定三：Workflow Prompt 按步驟分離，而非一個大 Prompt**
+
+信用卡掛失的 5 個步驟，每個步驟用不同的 Prompt，原因：
+- 每步驟的 context 不同（Step 1 需要 id_last4、Step 2 需要 cards list）
+- 每步驟的失敗處理不同（Step 1 最多 3 次、Step 3 可取消）
+- 一個大 Prompt 包含所有步驟會讓 AI 混淆當前在哪個步驟
+
+**決定四：RAG Answer Prompt 強調 Context-only**
+
+RAG Prompt 的核心約束是「只根據提供的 Context 回答，不使用訓練知識補充」。
+這個限制讓幻覺的空間縮小到「改寫知識庫內容」的範圍，比「憑空生成」風險低得多。
+
+## ③ Implementation & Iteration
+
+**產出物清單：**
+
+| 文件 | 內容 |
+|------|------|
+| `docs/agent_design.md` | AgentState TypedDict、6 個 Node 設計、9 個 Tool spec、LangGraph 流程圖 |
+| `docs/prompt_engineering/system_prompt.md` | System Prompt v1.0 + 版本歷史 + 測試案例 |
+| `docs/prompt_engineering/intent_classifier.md` | 分類 Prompt + 路由邏輯 + 10 個測試案例 |
+| `docs/prompt_engineering/safety_guard.md` | 三層安全設計 + 詐騙偵測 + Disclaimer 注入邏輯 |
+| `docs/prompt_engineering/rag_answer.md` | Context-only Prompt + Sprint 1-4 Stuffing 版 + Sprint 5 RAG 版 |
+| `docs/prompt_engineering/workflow_card_loss.md` | 5 步驟完整 Prompt + 邊界情境表格 |
+
+**設計過程中發現的問題：**
+
+- `workflow_data` 需要在 AgentState 中設計為 mutable dict，允許逐步填入（id_last4、card_id、ticket_id），這個結構在 Sprint 3 實作時需要小心初始化
+- Intent Classifier 的 `unclear` 情境需要一個「最多問 2 次再提供選單」的機制，這個計數器也需要在 AgentState 中追蹤
+
+## ④ Evaluation & Reflection
+
+**有效的部分：**
+- Prompt 規格文件讓每個 Sprint 的實作有明確依據，不需要在寫程式時臨時決定 AI 說什麼
+- 9 個 Tool spec 用 OpenAI-compatible 格式撰寫，Sprint 6 移植到 LangGraph 時可直接使用
+- Safety Guard 的三層架構清楚說明了責任分界，面試時可以系統性地回答「如何防止 AI 幻覺」
+
+**下一步（Sprint 0 → Sprint 1）：**
+Phase 5 文件完成後，正式進入實作階段。
+
+Sprint 0（專案骨架）：
+- 建立 `requirements.txt`
+- 建立 `backend/main.py` FastAPI 骨架
+- 建立 `frontend/app.py` Streamlit 骨架
+- 確認 `.env` 和 `ANTHROPIC_API_KEY` 設定
+
+Sprint 1（FAQ with Context Stuffing）：
+- Streamlit 聊天介面 + FastAPI `/chat` endpoint
+- 使用 Context Stuffing + System Prompt 回答 FAQ
+- 通過 10 個基本 FAQ 測試問題
+
+---
+---
+
 # Sprint 1：FAQ（Context Stuffing）
 
 ## ① Requirement & Discovery
