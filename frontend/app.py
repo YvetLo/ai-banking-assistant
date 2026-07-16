@@ -44,6 +44,7 @@ def init_session():
         "user_id": None,
         "user_name": None,
         "is_authenticated": False,
+        "workflow": {"step": 0, "data": {}},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -103,7 +104,7 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    st.write(f"**Sprint**: 2 — FAQ + Account Query")
+    st.write(f"**Sprint**: 3 — FAQ + Account + Card Loss")
     st.write(f"**Session**: `{st.session_state.session_id[:8]}...`")
     lang_label = "🇹🇼 繁體中文" if st.session_state.language == "zh" else "🇺🇸 English"
     st.write(f"**語言**: {lang_label}")
@@ -115,6 +116,7 @@ with st.sidebar:
         st.caption("• 我本月帳單多少？")
         st.caption("• 我的帳戶餘額是多少？")
         st.caption("• 幫我看最近的消費明細")
+        st.caption("• 我要掛失信用卡")
         st.caption("• What's my current bill?")
     else:
         st.caption("• 信用卡年費多少？")
@@ -137,6 +139,12 @@ st.info(DISCLAIMER[lang])
 
 if st.session_state.is_authenticated:
     st.caption(f"🔓 登入身分：{st.session_state.user_name}")
+
+# Workflow progress banner
+wf_step = st.session_state.workflow.get("step", 0)
+if wf_step > 0:
+    STEP_LABELS = {1: "步驟 1/3：身分驗證", 2: "步驟 2/3：選擇卡片", 3: "步驟 3/3：確認掛失"}
+    st.warning(f"🔒 信用卡掛失流程進行中 — {STEP_LABELS.get(wf_step, '')}　　輸入「取消」可結束流程")
 
 st.divider()
 
@@ -169,6 +177,7 @@ if user_input:
                         "session_id": st.session_state.session_id,
                         "history": st.session_state.messages,
                         "user_id": st.session_state.user_id,
+                        "workflow": st.session_state.workflow,
                     },
                     timeout=30,
                 )
@@ -176,6 +185,7 @@ if user_input:
                 data = resp.json()
                 assistant_reply = data["response"]
                 st.session_state.language = data.get("language", "zh")
+                st.session_state.workflow = data.get("workflow", {"step": 0, "data": {}})
 
             except requests.exceptions.ConnectionError:
                 assistant_reply = (
