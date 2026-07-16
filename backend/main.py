@@ -1,6 +1,6 @@
 """
 AI Banking Customer Assistant — Backend API
-Sprint 3: FAQ + Account Query + Card Loss Workflow + Tickets
+Sprint 4: FAQ + Account + Card Loss + Human Handoff + Dashboard
 """
 
 import os
@@ -16,16 +16,18 @@ from langdetect import detect, LangDetectException
 from pydantic import BaseModel
 
 from backend.src.card_loss_workflow import handle_step as card_loss_step
-from backend.src.database import create_ticket, get_tickets, init_db
+from backend.src.database import (create_ticket, get_stats, get_tickets,
+                                   get_unresolved, init_db, log_unresolved)
 from backend.src.mock_api.api import router as mock_api_router
 from backend.src.mock_api.mock_data import get_user_by_id
+from backend.src.rag.retriever import RAGRetriever
 
 load_dotenv()
 
 app = FastAPI(
     title="AI Banking Assistant API",
-    description="XX Bank AI Customer Service — Sprint 3 (FAQ + Account + Card Loss + Tickets)",
-    version="3.0.0",
+    description="XX Bank AI Customer Service — Sprint 4 (FAQ + Account + Card Loss + Handoff + Dashboard)",
+    version="4.0.0",
 )
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -35,13 +37,21 @@ app.include_router(mock_api_router)
 @app.on_event("startup")
 def startup():
     init_db()
+    global retrievers
+    retrievers = {
+        "zh": RAGRetriever("zh", INDEX_DIR),
+        "en": RAGRetriever("en", INDEX_DIR),
+    }
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).parent.parent
 KB_DIR = PROJECT_ROOT / "data" / "knowledge_base"
+INDEX_DIR = PROJECT_ROOT / "data" / "faiss_index"
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", 1024))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", 10))
 MODEL = "claude-haiku-4-5"
+
+retrievers: dict[str, RAGRetriever] = {}  # populated at startup
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -68,9 +78,35 @@ def detect_language(text: str) -> str:
 
 # ── Intent Helpers ─────────────────────────────────────────────────────────────
 CARD_LOSS_KW = ["掛失", "遺失", "不見了", "被偷", "lost card", "card lost", "stolen card", "block my card"]
+HANDOFF_KW   = ["投訴", "申訴", "真人", "客服人員", "我要告", "complaint", "speak to agent", "speak to human", "human agent", "real person"]
+NEGATIVE_KW  = ["不對", "不是", "沒幫助", "幫不上", "沒有回答", "不是這樣", "還是不懂", "你搞錯了",
+                 "wrong", "not helpful", "not what i asked", "didn't answer", "useless", "that's not right"]
 
 def is_card_loss(text: str) -> bool:
     return any(kw in text.lower() for kw in CARD_LOSS_KW)
+
+def is_handoff_trigger(text: str) -> bool:
+    return any(kw in text.lower() for kw in HANDOFF_KW)
+
+def is_negative_feedback(text: str) -> bool:
+    return any(kw in text.lower() for kw in NEGATIVE_KW)
+
+HANDOFF_MSG = {
+    "zh": (
+        "很抱歉我沒能完全解決您的問題。\n\n"
+        "📞 **客服專線：0800-XXX-XXX**\n"
+        "🕐 週一至週五 08:00–22:00\n\n"
+        "緊急服務（掛失、帳戶凍結）：24 小時真人接聽，請選「緊急服務」。\n\n"
+        "本次對話記錄已保存，客服人員可查閱。感謝您的耐心！"
+    ),
+    "en": (
+        "I'm sorry I couldn't fully resolve your issue.\n\n"
+        "📞 **Hotline: 0800-XXX-XXX**\n"
+        "🕐 Mon–Fri 08:00–22:00\n\n"
+        "Emergency (card loss, account freeze): 24/7 live agents — select 'Emergency Services'.\n\n"
+        "This conversation has been saved for our team. Thank you for your patience!"
+    ),
+}
 
 # ── User Context Formatter ─────────────────────────────────────────────────────
 def format_user_context(user: dict, language: str) -> str:
@@ -162,8 +198,9 @@ For ANY response mentioning rates, fees, or financial figures, end with:
 - Tables/bullets only for 3+ comparable items; otherwise prose
 
 ## Answer Rules
-- Use ONLY the Knowledge Base or User Account Data below
-- If unavailable: say so honestly, provide 0800-XXX-XXX
+- Use ONLY the Retrieved Knowledge Chunks or User Account Data below
+- If the chunks don't contain the answer, say so honestly and provide 0800-XXX-XXX
+- Do NOT make up fees, rates, or rules not found in the chunks
 
 ## Human Handoff
 If user mentions 投訴 申訴 真人 客服人員 complaint "human agent": provide hotline 0800-XXX-XXX immediately.
@@ -171,11 +208,11 @@ If user mentions 投訴 申訴 真人 客服人員 complaint "human agent": prov
 ## Current User Account Data
 {user_context}
 
-## Knowledge Base
-{knowledge_base}
+## Retrieved Knowledge Base Chunks
+{rag_context}
 """
 
-def build_system_prompt(language: str, user_id: Optional[str]) -> str:
+def build_system_prompt(language: str, user_id: Optional[str], rag_context: str = "") -> str:
     cfg = CONFIGS[language]
     if user_id:
         user = get_user_by_id(user_id)
@@ -187,7 +224,7 @@ def build_system_prompt(language: str, user_id: Optional[str]) -> str:
         out_of_scope=cfg["out_of_scope"],
         disclaimer=cfg["disclaimer"],
         user_context=ctx,
-        knowledge_base=KB[language],
+        rag_context=rag_context or "(No knowledge base chunks retrieved.)",
     )
 
 # ── Models ─────────────────────────────────────────────────────────────────────
@@ -205,12 +242,16 @@ class ChatRequest(BaseModel):
     history: list[Message] = []
     user_id: Optional[str] = None
     workflow: WorkflowState = WorkflowState()
+    fallback_count: int = 0       # consecutive unresolved turns, tracked by frontend
+    force_handoff: bool = False   # frontend sends True when fallback_count >= 3
 
 class ChatResponse(BaseModel):
     response: str
     language: str
     session_id: str
     workflow: WorkflowState = WorkflowState()
+    is_negative_feedback: bool = False
+    rag_sources: list[str] = []  # source file names used for this answer
 
 # ── Chat Endpoint ──────────────────────────────────────────────────────────────
 @app.post("/chat", response_model=ChatResponse)
@@ -218,20 +259,29 @@ async def chat(req: ChatRequest):
     language = detect_language(req.message)
     wf = req.workflow
 
-    # ── Active workflow: route to state machine ──────────────────────────────
+    # ── Active card-loss workflow ─────────────────────────────────────────────
     if wf.step > 0:
         if not req.user_id:
             msg = "請先登入才能繼續掛失流程。" if language == "zh" else "Please log in to continue."
             return ChatResponse(response=msg, language=language, session_id=req.session_id)
         response_text, updated = card_loss_step(req.message, wf.model_dump(), req.user_id, language)
         return ChatResponse(
-            response=response_text,
-            language=language,
-            session_id=req.session_id,
-            workflow=WorkflowState(**updated),
+            response=response_text, language=language,
+            session_id=req.session_id, workflow=WorkflowState(**updated),
         )
 
-    # ── Card loss intent: start workflow ─────────────────────────────────────
+    # ── Human Handoff: keyword trigger ────────────────────────────────────────
+    if is_handoff_trigger(req.message) or req.force_handoff:
+        reason = "handoff_keyword" if is_handoff_trigger(req.message) else "fallback_threshold"
+        log_unresolved(
+            session_id=req.session_id, user_query=req.message,
+            language=language, trigger_reason=reason, intent="escalation",
+        )
+        return ChatResponse(
+            response=HANDOFF_MSG[language], language=language, session_id=req.session_id,
+        )
+
+    # ── Card loss intent: start workflow ──────────────────────────────────────
     if is_card_loss(req.message):
         if not req.user_id:
             msg = ("要辦理掛失，需要先登入才能驗證身分。請點側邊欄登入！"
@@ -239,16 +289,42 @@ async def chat(req: ChatRequest):
             return ChatResponse(response=msg, language=language, session_id=req.session_id)
         msg = ("好的，馬上協助您辦理掛失！\n\n為了保護帳戶安全，需要先確認身分。\n**請問您的身分證後四碼是？**"
                if language == "zh"
-               else "I'll help you block the card right away!\n\nFirst, I need to verify your identity.\n**What are the last 4 digits of your national ID?**")
+               else "I'll help you block the card right away!\n\nTo protect your account, I need to verify your identity.\n**What are the last 4 digits of your national ID?**")
         return ChatResponse(
-            response=msg,
-            language=language,
-            session_id=req.session_id,
-            workflow=WorkflowState(step=1),
+            response=msg, language=language,
+            session_id=req.session_id, workflow=WorkflowState(step=1),
         )
 
+    # ── Negative feedback: log + still answer ─────────────────────────────────
+    neg_fb = is_negative_feedback(req.message)
+    if neg_fb:
+        log_unresolved(
+            session_id=req.session_id, user_query=req.message,
+            language=language, trigger_reason="negative_feedback", intent="feedback",
+        )
+
+    # ── RAG Retrieval ─────────────────────────────────────────────────────────
+    retriever = retrievers.get(language)
+    rag_chunks: list[dict] = []
+    rag_sources: list[str] = []
+
+    if retriever and retriever.is_ready:
+        rag_chunks = retriever.retrieve(req.message)
+        rag_sources = list(dict.fromkeys(c["source"] for c in rag_chunks))  # dedup, order-preserving
+        # Log unresolved if no chunk passes similarity threshold (FAQ miss)
+        if not retriever.has_relevant_results(rag_chunks) and not req.user_id:
+            log_unresolved(
+                session_id=req.session_id, user_query=req.message,
+                language=language, trigger_reason="rag_low_similarity", intent="faq",
+                similarity_score=rag_chunks[0]["score"] if rag_chunks else None,
+            )
+        rag_context = retriever.format_context(rag_chunks)
+    else:
+        # Fallback: context stuffing (index not built yet)
+        rag_context = KB[language]
+
     # ── Normal FAQ / Account query via Claude ─────────────────────────────────
-    system_prompt = build_system_prompt(language, req.user_id)
+    system_prompt = build_system_prompt(language, req.user_id, rag_context=rag_context)
     history = req.history[-(MAX_HISTORY_TURNS * 2):]
     messages = [{"role": m.role, "content": m.content} for m in history]
     messages.append({"role": "user", "content": req.message})
@@ -261,17 +337,34 @@ async def chat(req: ChatRequest):
     except anthropic.APIError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    return ChatResponse(response=response_text, language=language, session_id=req.session_id)
+    return ChatResponse(
+        response=response_text, language=language,
+        session_id=req.session_id, is_negative_feedback=neg_fb,
+        rag_sources=rag_sources,
+    )
 
-# ── Tickets Endpoint ───────────────────────────────────────────────────────────
+# ── Data Endpoints ─────────────────────────────────────────────────────────────
 @app.get("/tickets")
 def list_tickets(user_id: Optional[str] = None, limit: int = 20):
     return get_tickets(user_id=user_id, limit=limit)
 
+@app.get("/unresolved")
+def list_unresolved(limit: int = 20):
+    return get_unresolved(limit=limit)
+
+@app.get("/stats")
+def stats():
+    return get_stats()
+
 @app.get("/health")
 def health():
+    rag_status = {
+        lang: retrievers[lang].is_ready if lang in retrievers else False
+        for lang in ["zh", "en"]
+    }
     return {
         "status": "ok",
-        "sprint": 3,
-        "mode": "context_stuffing + account_query + card_loss_workflow",
+        "sprint": 5,
+        "mode": "RAG + account_query + card_loss + handoff + dashboard",
+        "rag_index_ready": rag_status,
     }

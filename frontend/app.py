@@ -45,6 +45,8 @@ def init_session():
         "user_name": None,
         "is_authenticated": False,
         "workflow": {"step": 0, "data": {}},
+        "fallback_count": 0,
+        "rag_sources": [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -104,7 +106,10 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    st.write(f"**Sprint**: 3 — FAQ + Account + Card Loss")
+    st.write(f"**Sprint**: 5 — RAG + Account + Handoff")
+    fc = st.session_state.fallback_count
+    if fc > 0:
+        st.caption(f"⚠️ 連續未解決：{fc}/3")
     st.write(f"**Session**: `{st.session_state.session_id[:8]}...`")
     lang_label = "🇹🇼 繁體中文" if st.session_state.language == "zh" else "🇺🇸 English"
     st.write(f"**語言**: {lang_label}")
@@ -129,6 +134,8 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.session_id = str(uuid.uuid4())
         st.session_state.welcomed = False
+        st.session_state.workflow = {"step": 0, "data": {}}
+        st.session_state.fallback_count = 0
         st.rerun()
 
 # ── Main Chat Area ─────────────────────────────────────────────────────────────
@@ -170,6 +177,7 @@ if user_input:
     with st.chat_message("assistant"):
         with st.spinner("思考中..."):
             try:
+                fc = st.session_state.fallback_count
                 resp = requests.post(
                     f"{API_URL}/chat",
                     json={
@@ -178,6 +186,8 @@ if user_input:
                         "history": st.session_state.messages,
                         "user_id": st.session_state.user_id,
                         "workflow": st.session_state.workflow,
+                        "fallback_count": fc,
+                        "force_handoff": fc >= 3,
                     },
                     timeout=30,
                 )
@@ -186,6 +196,11 @@ if user_input:
                 assistant_reply = data["response"]
                 st.session_state.language = data.get("language", "zh")
                 st.session_state.workflow = data.get("workflow", {"step": 0, "data": {}})
+                st.session_state.rag_sources = data.get("rag_sources", [])
+                if data.get("is_negative_feedback"):
+                    st.session_state.fallback_count += 1
+                else:
+                    st.session_state.fallback_count = 0
 
             except requests.exceptions.ConnectionError:
                 assistant_reply = (
@@ -195,6 +210,9 @@ if user_input:
                 assistant_reply = f"⚠️ 錯誤：{e}"
 
         st.markdown(assistant_reply)
+        sources = st.session_state.get("rag_sources", [])
+        if sources:
+            st.caption(f"📚 參考來源：{', '.join(sources)}")
 
     st.session_state.messages.append({"role": "user", "content": user_input})
     st.session_state.messages.append({"role": "assistant", "content": assistant_reply})

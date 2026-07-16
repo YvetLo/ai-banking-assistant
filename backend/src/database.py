@@ -82,3 +82,48 @@ def get_tickets(user_id: str = None, limit: int = 20) -> list[dict]:
         ).fetchall()
     c.close()
     return [dict(r) for r in rows]
+
+
+def log_unresolved(
+    session_id: str,
+    user_query: str,
+    language: str,
+    trigger_reason: str,
+    intent: str = "unknown",
+    similarity_score: float = None,
+) -> None:
+    c = _conn()
+    c.execute(
+        "INSERT INTO unresolved_queries "
+        "(created_at, session_id, user_query, language, intent, trigger_reason, similarity_score) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (datetime.now().isoformat(), session_id, user_query, language, intent, trigger_reason, similarity_score),
+    )
+    c.commit()
+    c.close()
+
+
+def get_unresolved(limit: int = 20) -> list[dict]:
+    c = _conn()
+    rows = c.execute(
+        "SELECT * FROM unresolved_queries ORDER BY created_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def get_stats() -> dict:
+    c = _conn()
+    total_tickets = c.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
+    open_tickets = c.execute("SELECT COUNT(*) FROM tickets WHERE status='open'").fetchone()[0]
+    total_unresolved = c.execute("SELECT COUNT(*) FROM unresolved_queries").fetchone()[0]
+    by_reason_rows = c.execute(
+        "SELECT trigger_reason, COUNT(*) FROM unresolved_queries GROUP BY trigger_reason"
+    ).fetchall()
+    c.close()
+    return {
+        "total_tickets": total_tickets,
+        "open_tickets": open_tickets,
+        "total_unresolved": total_unresolved,
+        "unresolved_by_reason": {r[0]: r[1] for r in by_reason_rows},
+    }
