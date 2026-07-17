@@ -404,3 +404,6 @@ Router Node
 
 **問：同時支援多少用戶？**
 > Demo 版本為單用戶展示。生產環境加入 Rate Limiting（每用戶每分鐘限 10 次呼叫）、FAQ 回答 Redis 快取（相同問題不重複呼叫 Claude API）、水平擴展（多個 FastAPI instance + Load Balancer）。
+
+**問：FAQ Node 和 Account Node 是不是真的兩個獨立節點？**
+> 實作上是同一個函式（`qa_node`），Router 會標記 `intent="faq"` 或 `"account"` 讓 State 可追蹤、log 可分開統計，但兩者共用同一次 Claude 呼叫——因為 Sprint 1-5 驗證過的行為就是 system prompt 同時帶 RAG chunks 和帳務資料，一次回答可能橫跨兩種意圖的問題（例如「年費多少，另外我這個月帳單多少」）。拆成兩個真正獨立的 LLM 呼叫會改變外部行為，違反這次重構「只換架構、不換行為」的前提。這是刻意的技術債，不是沒想到：下一步如果要接 `get_account_balance` 等 tool call，會拆成真正獨立的 Account Node。

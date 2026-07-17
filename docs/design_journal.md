@@ -358,5 +358,34 @@ Sprint 1（FAQ with Context Stuffing）：
 *(Sprint 1 完成後填寫)*
 
 ---
+---
+
+# Sprint 6：LangGraph 重構
+
+## ① Requirement & Discovery
+
+Sprint 1-5 已經把 FAQ、帳務查詢、信用卡掛失、真人轉接、未解決記錄五種行為，全部用 `backend/main.py` 裡一連串 `if/else` 撐起來。邏輯是對的，但 `/chat` 這個函式一路長到 371 行，五種分支的輸入輸出混在一起，沒有任何一個地方能單獨看到「這個意圖進來、產生了什麼 state」。ADR-002 早就寫好了要在這個時間點升級：先讓業務邏輯跑通、驗證過，再換架構。Sprint 6 就是兌現這個承諾——目標不是新增功能，是把已經驗證過的行為，重新組織成有明確邊界、可追蹤 State 的 Graph。
+
+## ② Design Decision
+
+**維持「外部行為完全一致」的硬限制**：`docs/agent_design.md` 開頭就寫「Sprint 1-5 與 Sprint 6 的外部行為一致，差異只在內部架構」，所以重構過程中不新增、不修改任何使用者可觀察到的行為，純粹是把同一段邏輯搬進 Router / CardLoss / Handoff / FAQ / Account / Logger 六個 Node。
+
+**FAQ Node 和 Account Node 共用同一個實作**：這是最大的取捨。`docs/agent_design.md` §3.2/§3.3 把 FAQ 和 Account 寫成兩個獨立 Node，但 Sprint 1-5 的實際行為是——不管使用者問的是知識庫問題還是帳務問題，都丟進同一次 Claude 呼叫，system prompt 裡同時塞 RAG chunks 和使用者帳務資料（`format_user_context`）。如果為了呼應設計文件硬拆成兩個真正獨立的 LLM 呼叫，等於改變了實際行為（例如「我的信用卡年費是多少，另外我這個月帳單多少」這種混合問題，原本一次回答，拆開後可能要問兩次）。所以最後選擇：Router 仍然分類並標記 `intent="faq"` 或 `"account"`（State 上看得到、log 也分得開），但兩者路由到同一個 `qa_node`。這個決定的理由要在面試時說清楚：Node 邊界是為了可觀察性和未來擴充（如果之後真的要幫 Account 接 `get_account_balance` 之類的 tool call，只需要新增一個真正獨立的 Account Node，不影響 FAQ），不是為了現在就過度設計。
+
+**Logger Node 要撐住「一輪可能觸發兩次 log」的既有行為**：原本的 `if/else` 裡，`negative_feedback` 檢查和 RAG `low_similarity` 檢查是兩段獨立的程式碼，同一則訊息如果兩個條件都成立，會呼叫兩次 `log_unresolved`。重構時一開始想把 Logger 簡化成「只記一筆」，後來意識到這樣會悄悄改變外部行為（DB 記錄筆數變少），違反①的硬限制。最後讓 State 帶一個 `log_entries: list[dict]`，`qa_node`/`handoff_node` 各自往裡面 append，`logger_node` 迴圈寫入——這樣兩次 log 的行為原封不動保留。
+
+## ③ Implementation & Iteration
+
+把原本塞在 `main.py` 裡的關鍵字判斷（`is_card_loss`／`is_handoff_trigger`／`is_negative_feedback`）和語言偵測搬到新的 `backend/src/nlp.py`；system prompt 組裝（`build_system_prompt`／`format_user_context`／`CONFIGS`）搬到 `backend/src/prompts.py`。新增 `backend/src/agent/`（`state.py` 定義 `AgentState`、`nodes.py` 六個 Node 函式、`graph.py` 用 `langgraph.graph.StateGraph` 接線）。`main.py` 的 `/chat` endpoint 縮到只剩：組出 initial state → `agent_graph.invoke()` → 轉成 `ChatResponse`，Pydantic 的 `ChatRequest`／`ChatResponse` 完全沒動，前端 Streamlit 不用改一行。
+
+驗證方式：先用假的 `client`／`retriever`（回傳固定字串，不打真的 API）跑過六條路徑確認 Graph 走線正確；接著啟動真正的 `uvicorn`，用實際的 Claude API + FAISS index 跑了 FAQ（中英各一）、已登入帳務查詢、完整四步驟信用卡掛失流程、關鍵字轉真人、負面回饋+低相似度同時觸發五種情境，逐一比對 `/tickets`、`/unresolved`、`/stats` 三個 dashboard endpoint 的寫入結果，確認和 Sprint 5 的行為（包含「一輪兩筆 log」這個邊角案例）完全一致。
+
+## ④ Evaluation & Reflection
+
+實測跑下來，六個 Node 的行為和重構前逐項核對都一致，包含最容易漏掉的邊角案例：使用者在掛失流程中途被登出（`workflow_step > 0` 但沒有 `user_id`）時，原本的程式碼會把 workflow 悄悄重置成 step 0——這其實比較像是 Sprint 1-4 沒注意到的行為，而不是刻意設計。重構時選擇原封不動保留這個行為（沒有藉機「順手修掉」），因為 Sprint 6 的任務是重構架構、不是修正邏輯，兩件事分開做才不會讓「行為有沒有變」這個驗證變得混亂。這個小案例本身也是面試時可以講的故事：重構最大的風險不是寫錯新程式碼，而是「順手」把舊的（不管是不是 bug）行為改掉。
+
+下一版如果要繼續往前，Account Node 是最明確的候選：接上 §4 定義的 `get_account_balance`／`get_credit_card_bill`／`get_transactions` 等 tool spec，讓 Account 查詢真正走結構化 API 呼叫而不是整包 context stuffing，這樣可以顯著縮小 system prompt、也更貼近企業產線常見的 tool-calling Agent 設計。
+
+---
 
 *後續 Sprint 依此格式持續新增*
