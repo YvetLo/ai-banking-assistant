@@ -1,29 +1,36 @@
 """
-LangGraph Nodes — Sprint 6
+LangGraph Nodes — Sprint 6 (Router/CardLoss/Handoff/FAQ/Logger), Sprint 7 (Account)
 
-Each node reproduces exactly the branch of Sprint 1-5's if/else `chat()`
-handler it replaces (see git history of backend/main.py). External
-behavior is unchanged; only the control flow moved from if/else into a
-graph so each Node's input/output is independently traceable.
-
-FAQ Node and Account Node intentionally share one implementation
-(`make_qa_node`): Sprint 1-5 answers both intents with a single Claude
-call that already has RAG chunks *and* account data in its system
-prompt (see prompts.build_system_prompt). Splitting that into two real
-LLM calls would change observed behavior (and cost), which contradicts
-the Sprint 6 goal of "same external behavior, different internal
-architecture" (docs/agent_design.md §1). The Router still labels the
-turn `intent="account"` vs `"faq"` so the state trace stays meaningful;
-see docs/design_journal.md Sprint 6 entry.
+Sprint 6 moved Sprint 1-5's if/else `chat()` branches into a graph
+without changing external behavior. Sprint 7 gave the Account Node a
+real implementation: instead of stuffing the user's full account data
+into the FAQ Node's system prompt, it now runs its own Claude call with
+tools (get_account_balance / get_credit_card_bill / get_transactions)
+and only fetches what the question actually needs. See docs/ADR.md
+ADR-008 and docs/design_journal.md Sprint 7 entry for the reasoning.
 """
 
+import json
 from typing import Any
 
 from ..card_loss_workflow import handle_step as card_loss_step
 from ..database import log_unresolved
 from ..nlp import is_account_query, is_card_loss, is_handoff_trigger, is_negative_feedback, detect_language
-from ..prompts import HANDOFF_MSG, build_system_prompt
+from ..prompts import HANDOFF_MSG, build_account_system_prompt, build_system_prompt
 from .state import AgentState
+from .tools import ACCOUNT_TOOLS, execute_tool
+
+MAX_TOOL_ITERATIONS = 3
+
+NOT_LOGGED_IN_ACCOUNT = {
+    "zh": "要查詢帳務資訊，需要先登入喔！請點選側邊欄登入。",
+    "en": "Please log in first to check your account information.",
+}
+
+TOOL_LOOP_FALLBACK = {
+    "zh": "抱歉，這個查詢比較複雜，請稍後再試，或撥打客服專線 0800-XXX-XXX。",
+    "en": "Sorry, this request is taking a bit long. Please try again or call 0800-XXX-XXX.",
+}
 
 # ── Router Node ──────────────────────────────────────────────────────────────
 
@@ -87,7 +94,7 @@ def handoff_node(state: AgentState) -> dict:
     }
 
 
-# ── FAQ / Account Node ───────────────────────────────────────────────────────
+# ── FAQ Node ─────────────────────────────────────────────────────────────────
 
 def make_qa_node(client, retrievers: dict, kb: dict, model: str, max_tokens: int):
     def qa_node(state: AgentState) -> dict:
@@ -132,6 +139,49 @@ def make_qa_node(client, retrievers: dict, kb: dict, model: str, max_tokens: int
         }
 
     return qa_node
+
+
+# ── Account Node ─────────────────────────────────────────────────────────────
+
+def make_account_node(client, model: str, max_tokens: int):
+    def account_node(state: AgentState) -> dict:
+        language = state["language"]
+        user_id = state.get("user_id")
+
+        if not user_id:
+            return {"response": NOT_LOGGED_IN_ACCOUNT[language]}
+
+        system_prompt = build_account_system_prompt(language)
+        messages: list[dict[str, Any]] = list(state.get("messages", []))
+        messages.append({"role": "user", "content": state["user_message"]})
+
+        for _ in range(MAX_TOOL_ITERATIONS):
+            result = client.messages.create(
+                model=model, max_tokens=max_tokens, system=system_prompt,
+                messages=messages, tools=ACCOUNT_TOOLS,
+            )
+            if result.stop_reason != "tool_use":
+                text = "".join(b.text for b in result.content if b.type == "text")
+                return {"response": text}
+
+            messages.append({"role": "assistant", "content": result.content})
+            tool_results = []
+            for block in result.content:
+                if block.type == "tool_use":
+                    output = execute_tool(block.name, block.input, user_id)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(output, ensure_ascii=False),
+                    })
+            messages.append({"role": "user", "content": tool_results})
+
+        return {
+            "response": TOOL_LOOP_FALLBACK[language],
+            "log_entries": [{"trigger_reason": "tool_loop_exceeded", "intent": "account"}],
+        }
+
+    return account_node
 
 
 # ── Logger Node ──────────────────────────────────────────────────────────────

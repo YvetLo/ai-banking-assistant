@@ -212,5 +212,33 @@ response = client.chat.completions.create(model="gpt-4o-mini", ...)
 
 ---
 
-*最後更新：2026-07-06*
+## ADR-008：Account Node 改用 Tool-Calling 而非 Context Stuffing
+
+**決策日期**：2026-07-17
+**狀態**：已採用（Sprint 7）
+
+**背景**：
+Sprint 1-6 的帳務查詢，做法是把使用者的存款、信用卡、帳單、近期交易「全部」塞進 system prompt（`format_user_context`），FAQ 和 Account 共用同一次 Claude 呼叫（見 ADR-002 後續與 Sprint 6 design journal）。候選方案為 (A) 繼續 context stuffing，(B) Account Node 改用真正的 tool-calling，讓 Claude 依問題呼叫 `get_account_balance`／`get_credit_card_bill`／`get_transactions`。
+
+**決策**：選用方案 B，Account Node 成為獨立於 FAQ Node 的 tool-calling Agent。
+
+**理由**：
+- Context stuffing 把使用者不相關的資料（例如只問餘額，卻把信用卡額度、帳單、交易明細全部塞進去）都送進 prompt，浪費 token 也增加模型忽略指令、幻覺的機會
+- Tool-calling 讓 Claude 依實際問題決定要呼叫哪個 API，行為更貼近企業真實的 Agent 架構（呼叫核心銀行系統的真實 API，而不是把整包資料吐給 LLM）
+- Node 邊界因此變得名副其實：Sprint 6 的 Account「Node」其實只是 Router 打的一個標籤，Sprint 7 之後才是真正獨立的執行單元
+
+**安全性決策（附帶）**：
+`user_id` 刻意不放進暴露給 Claude 的 tool schema，而是由 Node 層在執行工具時直接注入（見 `backend/src/agent/tools.py`）。這與 `docs/agent_design.md` §4.2-4.4 原始 tool spec（把 `user_id` 列為參數）不同——那份規格是給通用伺服器端 API 設計的；在這裡如果讓模型自己填 `user_id`，等於讓 prompt injection 有機會查詢別人的帳戶，所以改由後端注入，不信任模型輸出的身分參數。
+
+**Trade-off**：
+- 每輪對話可能需要 2 次以上的 Claude API 呼叫（先觸發 tool_use，再送 tool_result 換最終回答），延遲和成本都比 context stuffing 高
+- 需要維護一個 tool-calling loop（`MAX_TOOL_ITERATIONS` 上限防止異常迴圈），比單次呼叫複雜
+- Router 用關鍵字判斷 `account` vs `faq` 意圖，仍可能誤判；誤判時 FAQ Node 的 context stuffing 還留著使用者帳務資料當作安全網（見 Sprint 6 journal），行為上不會完全答不出來，只是沒有用到 tool-calling 的精準度
+
+**生產環境方案**：
+`get_account_balance` 等函式目前是讀記憶體裡的 Mock 資料，正式環境會替換成呼叫核心銀行 API（含逾時、重試、稽核 log）。Router 的關鍵字分類也建議升級為真正的 LLM Intent Classification，降低誤判率。
+
+---
+
+*最後更新：2026-07-17*
 *每個 Sprint 遇到新的重要決策時，在此文件新增 ADR 條目。*

@@ -208,6 +208,38 @@ def get_card_by_id(user_id: str, card_id: str) -> dict | None:
     return None
 
 
+def get_account_balance(user_id: str, account_type: str = "all") -> dict:
+    """Get account balance(s). account_type: savings/checking/fixed_deposit/all."""
+    user = MOCK_USERS.get(user_id)
+    if not user:
+        return {"error": "User not found"}
+    accounts = user.get("accounts", {})
+    if account_type == "all":
+        return accounts
+    if account_type in accounts:
+        return {account_type: accounts[account_type]}
+    return {"error": f"No {account_type} account found for this user"}
+
+
+def get_credit_card_bill(user_id: str, month: str = "current_month") -> dict:
+    """Get credit card billing info. month: current_month/last_month."""
+    user = MOCK_USERS.get(user_id)
+    if not user:
+        return {"error": "User not found"}
+    bill = user.get("bill", {}).get(month)
+    if bill is None:
+        return {"error": f"No bill data for {month}"}
+    return bill
+
+
+def get_transactions(user_id: str, limit: int = 5) -> list[dict]:
+    """Get recent transaction history, most recent first."""
+    user = MOCK_USERS.get(user_id)
+    if not user:
+        return []
+    return user.get("recent_transactions", [])[:limit]
+
+
 def block_card(user_id: str, card_id: str) -> dict:
     """Block (report lost) a credit card. Returns result."""
     user = MOCK_USERS.get(user_id)

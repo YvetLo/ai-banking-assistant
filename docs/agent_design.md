@@ -1,8 +1,8 @@
 # AI Agent Design
 # AI Banking Customer Assistant
 
-**版本**：v1.0
-**對應 Sprint**：Sprint 6（LangGraph 架構），Sprint 1-5 使用函式路由（if/else）模擬相同行為
+**版本**：v1.1
+**對應 Sprint**：Sprint 6（LangGraph 架構）、Sprint 7（Account Node tool-calling），Sprint 1-5 使用函式路由（if/else）模擬相同行為
 
 ---
 
@@ -109,12 +109,12 @@ Intent Classification（LLM 分類）
 
 ---
 
-### 3.3 Account Node（帳務查詢）
+### 3.3 Account Node（帳務查詢）— Sprint 7 起為真正 tool-calling
 
 **職責**：驗證登入狀態，呼叫 Mock Banking API，整理成自然語言。
 
 **先決條件**：`state.user_authenticated == True`
-若未登入 → 引導登入，不進入此 Node
+若未登入 → Node 內直接回傳登入提示，不呼叫 Claude / 不執行任何 tool
 
 **支援意圖**：
 
@@ -123,6 +123,8 @@ Intent Classification（LLM 分類）
 | check_balance | `get_account_balance` | 帳戶餘額 |
 | check_bill | `get_credit_card_bill` | 應繳金額、截止日、最低應繳 |
 | check_transactions | `get_transactions` | 近期交易明細列表 |
+
+**實作備註（Sprint 7）**：`user_id` 不放進 Claude 看得到的 tool schema，由 `backend/src/agent/tools.py` 的 `execute_tool()` 在後端注入，避免模型被誘導查詢其他使用者的帳戶（詳見 ADR-008）。一輪對話最多允許 `MAX_TOOL_ITERATIONS=3` 次 tool-calling 迴圈，超過則回覆客服專線並記錄 `trigger_reason="tool_loop_exceeded"`。
 
 **輸出格式**（LLM 整理後）：
 ```
@@ -345,7 +347,7 @@ Step 4: 執行掛失 + 建立 Ticket
     "user_query": {"type": "string"},
     "language": {"type": "string", "enum": ["zh", "en"]},
     "intent": {"type": "string"},
-    "trigger_reason": {"type": "string", "enum": ["low_similarity", "handoff", "api_failure"]},
+    "trigger_reason": {"type": "string", "enum": ["low_similarity", "handoff", "api_failure", "tool_loop_exceeded"]},
     "session_id": {"type": "string"},
     "similarity_score": {"type": "number", "nullable": true}
   }
@@ -391,6 +393,7 @@ Router Node
 | Sprint 4 | 函式路由 + 觸發偵測 | + Handoff Node + Logger Node |
 | Sprint 5 | 函式路由 + FAISS | FAQ Node 升級為真正 RAG |
 | Sprint 6 | **LangGraph 重構** | 所有 Node 遷移為 LangGraph Graph |
+| Sprint 7 | **Account tool-calling** | Account Node 改為真正呼叫 `get_account_balance`／`get_credit_card_bill`／`get_transactions`，不再與 FAQ 共用 context stuffing |
 
 ---
 
@@ -406,4 +409,4 @@ Router Node
 > Demo 版本為單用戶展示。生產環境加入 Rate Limiting（每用戶每分鐘限 10 次呼叫）、FAQ 回答 Redis 快取（相同問題不重複呼叫 Claude API）、水平擴展（多個 FastAPI instance + Load Balancer）。
 
 **問：FAQ Node 和 Account Node 是不是真的兩個獨立節點？**
-> 實作上是同一個函式（`qa_node`），Router 會標記 `intent="faq"` 或 `"account"` 讓 State 可追蹤、log 可分開統計，但兩者共用同一次 Claude 呼叫——因為 Sprint 1-5 驗證過的行為就是 system prompt 同時帶 RAG chunks 和帳務資料，一次回答可能橫跨兩種意圖的問題（例如「年費多少，另外我這個月帳單多少」）。拆成兩個真正獨立的 LLM 呼叫會改變外部行為，違反這次重構「只換架構、不換行為」的前提。這是刻意的技術債，不是沒想到：下一步如果要接 `get_account_balance` 等 tool call，會拆成真正獨立的 Account Node。
+> Sprint 6 剛重構完的時候不是——兩者共用同一個函式（`qa_node`），因為 Sprint 1-5 驗證過的行為就是 system prompt 同時帶 RAG chunks 和帳務資料，拆成兩次真正獨立的 LLM 呼叫會改變外部行為，違反那次重構「只換架構、不換行為」的前提。這是刻意先欠的技術債，不是沒想到。Sprint 7 把這筆債還了：Account Node 現在是獨立的 tool-calling Agent，只在真正需要帳務資料時才呼叫對應的 tool，FAQ Node 的 context stuffing 則保留下來當作 Router 誤判時的安全網（詳見 ADR-008、Sprint 7 design journal）。
