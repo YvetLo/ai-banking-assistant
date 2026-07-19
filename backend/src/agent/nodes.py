@@ -1,5 +1,6 @@
 """
-LangGraph Nodes — Sprint 6 (Router/CardLoss/Handoff/FAQ/Logger), Sprint 7 (Account)
+LangGraph Nodes — Sprint 6 (Router/CardLoss/Handoff/FAQ/Logger), Sprint 7 (Account),
+Sprint 9 (Router → real LLM intent classification)
 
 Sprint 6 moved Sprint 1-5's if/else `chat()` branches into a graph
 without changing external behavior. Sprint 7 gave the Account Node a
@@ -8,6 +9,12 @@ into the FAQ Node's system prompt, it now runs its own Claude call with
 tools (get_account_balance / get_credit_card_bill / get_transactions)
 and only fetches what the question actually needs. See docs/ADR.md
 ADR-008 and docs/design_journal.md Sprint 7 entry for the reasoning.
+
+Sprint 9 replaced the Router's keyword matching with a real LLM
+classifier (see .intent.classify_intent) — the two exceptions,
+in-progress workflow continuation and the frontend's force_handoff
+flag, stay deterministic pre-checks because they're about server-side
+state, not about understanding what the user just said.
 """
 
 import json
@@ -15,8 +22,9 @@ from typing import Any
 
 from ..card_loss_workflow import handle_step as card_loss_step
 from ..database import log_unresolved
-from ..nlp import is_account_query, is_card_loss, is_handoff_trigger, is_negative_feedback, detect_language
+from ..nlp import is_negative_feedback, detect_language
 from ..prompts import HANDOFF_MSG, build_account_system_prompt, build_system_prompt
+from .intent import classify_intent
 from .state import AgentState
 from .tools import ACCOUNT_TOOLS, execute_tool
 
@@ -34,24 +42,28 @@ TOOL_LOOP_FALLBACK = {
 
 # ── Router Node ──────────────────────────────────────────────────────────────
 
-def router_node(state: AgentState) -> dict:
-    message = state["user_message"]
-    language = detect_language(message)
+def make_router_node(client, model: str):
+    def router_node(state: AgentState) -> dict:
+        message = state["user_message"]
+        language = detect_language(message)
 
-    # An in-progress card-loss workflow always continues, regardless of
-    # what the user types next (mirrors Sprint 3's `if wf.step > 0` guard).
-    if state.get("workflow_step", 0) > 0:
-        return {"language": language, "intent": "card_loss"}
+        # An in-progress card-loss workflow always continues, regardless of
+        # what the user types next (mirrors Sprint 3's `if wf.step > 0` guard).
+        # Deterministic — this is server-side state, not intent to classify.
+        if state.get("workflow_step", 0) > 0:
+            return {"language": language, "intent": "card_loss"}
 
-    if is_handoff_trigger(message) or state.get("force_handoff"):
-        reason = "handoff_keyword" if is_handoff_trigger(message) else "fallback_threshold"
-        return {"language": language, "intent": "handoff", "handoff_reason": reason}
+        # Frontend sets this once fallback_count crosses the threshold;
+        # also deterministic, independent of what this message says.
+        if state.get("force_handoff"):
+            return {"language": language, "intent": "handoff", "handoff_reason": "fallback_threshold"}
 
-    if is_card_loss(message):
-        return {"language": language, "intent": "card_loss"}
+        intent = classify_intent(client, model, message)
+        if intent == "handoff":
+            return {"language": language, "intent": "handoff", "handoff_reason": "handoff_intent"}
+        return {"language": language, "intent": intent}
 
-    intent = "account" if is_account_query(message) else "faq"
-    return {"language": language, "intent": intent}
+    return router_node
 
 
 # ── CardLoss Node ────────────────────────────────────────────────────────────
@@ -87,7 +99,7 @@ def card_loss_node(state: AgentState) -> dict:
 
 def handoff_node(state: AgentState) -> dict:
     language = state["language"]
-    reason = state.get("handoff_reason", "handoff_keyword")
+    reason = state.get("handoff_reason", "handoff_intent")
     return {
         "response": HANDOFF_MSG[language],
         "log_entries": [{"trigger_reason": reason, "intent": "escalation"}],

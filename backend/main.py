@@ -24,8 +24,8 @@ load_dotenv()
 
 app = FastAPI(
     title="AI Banking Assistant API",
-    description="XX Bank AI Customer Service — Sprint 7 (LangGraph: Router/FAQ/Account(tool-calling)/CardLoss/Handoff/Logger)",
-    version="7.0.0",
+    description="XX Bank AI Customer Service — Sprint 9 (LangGraph: Router(LLM classification)/FAQ/Account(tool-calling)/CardLoss/Handoff/Logger)",
+    version="9.0.0",
 )
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -131,7 +131,7 @@ def health():
     }
     return {
         "status": "ok",
-        "sprint": 7,
-        "mode": "LangGraph (Router -> FAQ/Account[tool-calling]/CardLoss/Handoff/Logger)",
+        "sprint": 9,
+        "mode": "LangGraph (Router[LLM classification] -> FAQ/Account[tool-calling]/CardLoss/Handoff/Logger)",
         "rag_index_ready": rag_status,
     }

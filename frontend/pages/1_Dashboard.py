@@ -58,7 +58,7 @@ else:
     if by_reason:
         LABELS = {
             "negative_feedback": "😤 否定回饋",
-            "handoff_keyword": "🤝 要求真人",
+            "handoff_intent": "🤝 要求真人",
             "fallback_threshold": "🔁 連續未解決（≥3）",
         }
         chart_data = {LABELS.get(k, k): v for k, v in by_reason.items()}
@@ -79,7 +79,7 @@ elif not unresolved:
 else:
     REASON_LABEL = {
         "negative_feedback": "😤 否定回饋",
-        "handoff_keyword": "🤝 要求真人",
+        "handoff_intent": "🤝 要求真人",
         "fallback_threshold": "🔁 連續未解決",
     }
     rows = [

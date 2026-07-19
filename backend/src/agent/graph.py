@@ -1,5 +1,6 @@
 """
-LangGraph wiring — Sprint 6 (graph structure), Sprint 7 (real Account Node)
+LangGraph wiring — Sprint 6 (graph structure), Sprint 7 (real Account Node),
+Sprint 9 (Router uses LLM intent classification)
 
     START
       │
@@ -25,11 +26,12 @@ from .state import AgentState
 
 
 def build_graph(client, retrievers: dict, kb: dict, model: str, max_tokens: int):
+    router_node = N.make_router_node(client, model)
     qa_node = N.make_qa_node(client, retrievers, kb, model, max_tokens)
     account_node = N.make_account_node(client, model, max_tokens)
 
     graph = StateGraph(AgentState)
-    graph.add_node("router", N.router_node)
+    graph.add_node("router", router_node)
     graph.add_node("card_loss", N.card_loss_node)
     graph.add_node("handoff", N.handoff_node)
     graph.add_node("qa", qa_node)

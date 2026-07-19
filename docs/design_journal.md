@@ -451,5 +451,40 @@ Sprint 1-7 每一輪都是手動測試——啟動 `uvicorn`、用 curl 或 Pyth
 下一步如果要讓這套測試更完整，比較明確的候選是：(1) 把 `on_event("startup")` 換成 FastAPI 建議的 `lifespan` 寫法，消除目前測試輸出裡的 deprecation warning；(2) 若之後想接 GitHub Actions 秀 CI 徽章，需要另外決定 `ANTHROPIC_API_KEY` 怎麼安全地存進 GitHub Secrets，以及能不能接受每次 push 都燒一次 token 的成本。
 
 ---
+---
+
+# Sprint 9：Router LLM Intent Classification
+
+## ① Requirement & Discovery
+
+`docs/agent_design.md` §3.1 從專案一開始（Phase 5，寫在 Sprint 1 之前）就把 Router 定義成「Intent Classification（LLM 分類）」，但 Sprint 1-8 一直是用關鍵字比對頂著——這件事在 Sprint 7、Sprint 8 的反思裡都各自提過一次，是明確欠著的一筆債。這次要還的不是新功能，是讓實作終於對齊最早寫下的設計文件。動機也很具體：關鍵字比對的失敗模式是結構性的，不是清單不夠長的問題——它只能比對「有沒有出現特定字」，沒辦法理解語意，遇到清單沒覆蓋到的講法就會誤判。
+
+## ② Design Decision
+
+**用 `tool_choice` 強制結構化輸出，不解析自由文字**：分類器呼叫 Claude 時用 `tool_choice={"type": "tool", "name": "classify_intent"}` 強迫模型一定要呼叫這個 tool、一定要從四個分類（`faq`／`account`／`card_loss`／`handoff`）裡選一個。這樣拿到的結果保證合法，不需要處理「模型沒照格式回答」這種例外，也不用寫文字比對或 regex 去猜模型想表達哪個分類。這個做法直接複用了 Sprint 7 已經驗證過的 tool-calling 模式，只是這次工具不是拿去查資料，而是拿來逼出一個結構化分類結果——算是同一個技術手法的第二種用法，這點在面試時值得提。
+
+**兩種情況刻意不呼叫分類器**：掛失流程進行中（`workflow_step > 0`）和前端強制轉真人（`force_handoff`，連續 fallback 達門檻）維持原本的確定性判斷，直接跳過 LLM。這兩者本質上是「系統目前處於什麼狀態」，不是「使用者這句話是什麼意圖」——如果連這個都交給 LLM 判斷，等於把一個原本 100% 確定的邏輯，換成一個有機率誤判的邏輯，沒有任何好處，純粹增加延遲和不確定性。這個判斷跟 Sprint 6 保留「一輪兩筆 log」行為是同一種思路：分清楚「這是系統狀態」還是「這是需要理解的內容」，兩者的處理方式不該混在一起。
+
+**FAQ Node 的 context stuffing 繼續留著當安全網**：這個決定 Sprint 7 就做過一次，這次沒有理由推翻——即使分類器比關鍵字準，還是有機率誤判，FAQ Node 的 system prompt 仍然帶著使用者帳務資料，誤判時不會完全答不出來。
+
+## ③ Implementation & Iteration
+
+新增 `backend/src/agent/intent.py`：`INTENT_CLASSIFIER_TOOL` 定義四分類 tool schema，`classify_intent()` 用強制 tool_choice 呼叫並取出分類結果。`nodes.py` 的 `router_node` 改寫成 `make_router_node(client, model)` 工廠函式，保留 `workflow_step > 0` 和 `force_handoff` 兩個確定性分支，其餘交給 `classify_intent()`。`nlp.py` 刪掉三個變成死代碼的關鍵字函式（`is_card_loss`／`is_handoff_trigger`／`is_account_query`）和對應的關鍵字清單，只留 `is_negative_feedback`（FAQ/Account Node 內部用，跟路由是不同關注點）和 `detect_language`。
+
+第一版寫完直接被 Sprint 8 的測試套件抓到一個問題：`test_negative_feedback_and_low_similarity_dual_log`（Sprint 6 就存在的回歸測試）失敗，原因是「你搞錯了，這不是我要的答案」被分類器誤判成 `handoff`——這句話單獨看確實像在抱怨，分類器沒有上下文，判斷「使用者聽起來不爽 = 想找真人」不是完全沒道理的推論，但這跟系統原本的設計不符（單純的負面回饋走 `negative_feedback` log，不直接升級成 Handoff）。修法是在 tool description 裡明確列出反例（「單純說答案不對／沒幫助，不算要求轉真人」），並補一個 `no prior conversation` 的提醒，讓模型知道自己只看得到這一句話、沒有前後文可以判斷。修完後另外寫了 `tests/test_router_intent.py` 直接測 `classify_intent()` 本身（不透過完整 `/chat`），把這個案例釘成一個獨立的分類器回歸測試——這樣以後如果又不小心把 tool description 改壞，能直接定位到是分類器的問題，不用先猜是不是 FAQ Node 或 DB 寫入壞了。
+
+順手處理了兩個因為改名而出現的殘留：`trigger_reason` 從 `"handoff_keyword"` 改名成 `"handoff_intent"`（因為觸發方式已經不是關鍵字了），這個字串同時出現在 `nodes.py` 的預設值和 `frontend/pages/1_Dashboard.py` 的兩個 Dashboard 圖表 label 對照表裡——後者如果沒改，Dashboard 上「要求真人」這個分類會因為字典查不到 key 而直接顯示英文原始字串，不會報錯但會很難看，算是那種「不會壞、但會露餡」的細節。
+
+驗證方式：連續跑兩次完整 pytest 套件（19 個測試，含新增的 `test_router_intent.py` 5 個案例）確認結果穩定；跑完後檢查真實 `data/banking.db` 沒有任何變化，確認 Sprint 8 的隔離設計在這次改動後依然有效。
+
+## ④ Evaluation & Reflection
+
+這次最有價值的部分不是分類器本身寫出來了，而是「寫完馬上被自動化測試抓到一個沒預料到的誤判案例」這個過程本身——如果沒有 Sprint 8 先把測試套件建起來，這個誤判很可能要等到手動測試、甚至demo 時才會被發現，而且很可能被忽略過去（畢竟「你搞錯了」被當成抱怨要轉真人，語意上不算離譜，不仔細看行為對不對就很容易滑過去）。這也是這幾個 Sprint 疊起來的複利效果：Sprint 6 定義清楚 Node 邊界、Sprint 7 建立 tool-calling 模式、Sprint 8 把回歸測試變成可重跑的東西，Sprint 9 才有辦法在改動當下就抓到問題，而不是憑感覺相信「LLM 應該分得出來」。
+
+比較意外的收穫是「Sprint 9 讓測試套件的成本模型也跟著變了」——Sprint 8 完成時特別強調 CardLoss／Handoff 測試零成本，因為關鍵字路由不呼叫 API；Sprint 9 把路由本身換成 LLM 之後，這個「零成本」的說法已經不完全準確（每個流程的第一句觸發訊息現在都要過一次分類器）。這提醒了自己：文件裡寫「零成本」這種具體宣稱時，要意識到它是建立在當下架構上的，架構一變就要回頭檢查有沒有跟著過時——這次有記得回去更新 Sprint 8 測試檔案的 docstring，但如果沒有測試套件這個明確的參照物，這種文件跟實作脫節的狀況很容易被忽略。
+
+下一步如果要讓 Router 更完整，比較明確的候選是 §3.1 提到但 v1 一直沒做的「意圖分類信心度低 → 反問用戶」——現在用 `tool_choice` 強制輸出，拿到的是確定結果，沒有信心分數可以判斷模型是不是在瞎猜，如果要做需要換一種呼叫方式（例如比較拿掉強制呼叫後模型會不會遲疑、或用 logprobs）。這個功能對「展示核心 Agent 架構」的邊際效益不高，暫不列入下一個 Sprint。
+
+---
 
 *後續 Sprint 依此格式持續新增*

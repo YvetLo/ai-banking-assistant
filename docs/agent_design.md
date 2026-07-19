@@ -1,8 +1,8 @@
 # AI Agent Design
 # AI Banking Customer Assistant
 
-**版本**：v1.1
-**對應 Sprint**：Sprint 6（LangGraph 架構）、Sprint 7（Account Node tool-calling），Sprint 1-5 使用函式路由（if/else）模擬相同行為
+**版本**：v1.2
+**對應 Sprint**：Sprint 6（LangGraph 架構）、Sprint 7（Account Node tool-calling）、Sprint 9（Router LLM 意圖分類），Sprint 1-5 使用函式路由（if/else）模擬相同行為
 
 ---
 
@@ -48,7 +48,7 @@ class AgentState(TypedDict):
 
 ## 3. Node 設計
 
-### 3.1 Router Node（意圖路由）
+### 3.1 Router Node（意圖路由）— Sprint 9 起為真正 LLM 分類
 
 **職責**：分析用戶輸入，判斷意圖類型，路由到對應 Node。
 
@@ -80,8 +80,12 @@ Intent Classification（LLM 分類）
 ```
 
 **Fallback 條件**：
-- 意圖分類信心度低 → 反問用戶（最多 2 次）
-- 連續 3 次無法解決 → 強制觸發 Handoff Node
+- 意圖分類信心度低 → 反問用戶（最多 2 次）*(v1 未實作——目前用 `tool_choice` 強制模型一定要回傳四類其中之一，沒有「信心度」可讀，也就沒有反問迴圈；見 ADR-009)*
+- 連續 3 次無法解決 → 強制觸發 Handoff Node（由前端 `fallback_count` 追蹤、`force_handoff` flag 觸發，這條路徑不經過分類器，見 §7 Q&A）
+
+**實作備註（Sprint 9）**：Sprint 1-8 用關鍵字比對（`is_card_loss`／`is_handoff_trigger`／`is_account_query`）模擬這個 Node，Sprint 9 換成 `backend/src/agent/intent.py` 的 `classify_intent()`——用 Claude 的 `tool_choice` 強制呼叫 `classify_intent` 這個 tool，保證一定拿到 `faq`／`account`／`card_loss`／`handoff` 四選一的結構化結果，不用解析自由文字。以下兩種情況**不會**呼叫分類器，屬於確定性的系統狀態判斷，不是「使用者這句話是什麼意圖」：
+1. `workflow_step > 0`（掛失流程進行中）→ 一律路由到 CardLoss Node
+2. `force_handoff == True`（前端偵測到連續 fallback）→ 一律路由到 Handoff Node，`trigger_reason="fallback_threshold"`
 
 ---
 
@@ -226,7 +230,7 @@ Step 4: 執行掛失 + 建立 Ticket
     "user_query": original_user_message,
     "language": state["language"],
     "intent": state["intent"],
-    "trigger_reason": "low_similarity" | "handoff" | "api_failure",
+    "trigger_reason": "rag_low_similarity" | "negative_feedback" | "handoff_intent" | "fallback_threshold" | "tool_loop_exceeded",
     "similarity_score": float or None,
     "created_at": datetime.now()
 }
@@ -347,7 +351,7 @@ Step 4: 執行掛失 + 建立 Ticket
     "user_query": {"type": "string"},
     "language": {"type": "string", "enum": ["zh", "en"]},
     "intent": {"type": "string"},
-    "trigger_reason": {"type": "string", "enum": ["low_similarity", "handoff", "api_failure", "tool_loop_exceeded"]},
+    "trigger_reason": {"type": "string", "enum": ["rag_low_similarity", "negative_feedback", "handoff_intent", "fallback_threshold", "tool_loop_exceeded"]},
     "session_id": {"type": "string"},
     "similarity_score": {"type": "number", "nullable": true}
   }
@@ -394,6 +398,8 @@ Router Node
 | Sprint 5 | 函式路由 + FAISS | FAQ Node 升級為真正 RAG |
 | Sprint 6 | **LangGraph 重構** | 所有 Node 遷移為 LangGraph Graph |
 | Sprint 7 | **Account tool-calling** | Account Node 改為真正呼叫 `get_account_balance`／`get_credit_card_bill`／`get_transactions`，不再與 FAQ 共用 context stuffing |
+| Sprint 8 | **測試套件** | pytest + 獨立 test.db，14 個測試案例涵蓋所有 Node |
+| Sprint 9 | **Router LLM 意圖分類** | 關鍵字比對換成 `classify_intent()`，用 `tool_choice` 強制結構化分類，兌現 §3.1 一開始就寫好的規格 |
 
 ---
 
@@ -410,3 +416,9 @@ Router Node
 
 **問：FAQ Node 和 Account Node 是不是真的兩個獨立節點？**
 > Sprint 6 剛重構完的時候不是——兩者共用同一個函式（`qa_node`），因為 Sprint 1-5 驗證過的行為就是 system prompt 同時帶 RAG chunks 和帳務資料，拆成兩次真正獨立的 LLM 呼叫會改變外部行為，違反那次重構「只換架構、不換行為」的前提。這是刻意先欠的技術債，不是沒想到。Sprint 7 把這筆債還了：Account Node 現在是獨立的 tool-calling Agent，只在真正需要帳務資料時才呼叫對應的 tool，FAQ Node 的 context stuffing 則保留下來當作 Router 誤判時的安全網（詳見 ADR-008、Sprint 7 design journal）。
+
+**問：Router 現在是不是每一輪對話都要多打一次 API？**
+> 不是每一輪，只有需要「理解使用者這句話是什麼意圖」的時候才打。掛失流程進行中（`workflow_step > 0`）和前端強制轉真人（`force_handoff`）這兩種情況是確定性的系統狀態判斷，直接跳過分類器；例如信用卡掛失走完整四步驟，只有第一句觸發訊息會呼叫一次分類器，後續三步都不用。真正每輪都會多付一次分類器成本的，是 FAQ／Account／首次要求真人這三種情境——換來的是不再有「信用卡年費」被關鍵字誤判成帳務查詢這類問題（詳見 ADR-009）。
+
+**問：意圖分類信心度低、需要反問用戶的邏輯做了嗎？**
+> 沒有。目前用 Claude 的 `tool_choice` 強制模型一定要從四個分類裡選一個，拿到的是確定的分類結果，沒有信心分數可以判斷「模型是不是在瞎猜」。§3.1 提到的「信心度低 → 反問（最多 2 次）」是 v1 尚未實作的功能，如果要做，需要換一種呼叫方式（例如讓模型輸出信心分數，或看 `tool_choice` 拿掉後模型會不會遲疑），目前判斷這個功能對展示核心 Agent 架構的邊際效益不高，先不做。

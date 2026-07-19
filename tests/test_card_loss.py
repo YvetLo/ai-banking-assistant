@@ -1,9 +1,14 @@
 """
-CardLoss Node — Sprint 8
+CardLoss Node — Sprint 8 (workflow), Sprint 9 (Router classification cost)
 
-The entire card-loss workflow (backend/src/card_loss_workflow.py) is
-pure Python state-machine logic — no Claude call at any step — so
-every assertion here is exact-match and these tests cost zero tokens.
+card_loss_workflow.py itself is pure Python state-machine logic — no
+Claude call at any step — so every assertion here is exact-match. As
+of Sprint 9, the FIRST message of each flow (the one that triggers the
+workflow) now costs one classify_intent() call in the Router before
+reaching this node; every subsequent step in a flow still skips the
+classifier entirely, because router_node checks workflow_step > 0
+before calling it. So each test below costs at most one small
+classification call, not one per turn.
 
 Each test uses its own mock user (see mock_api/mock_data.py) so a
 completed "block the card" flow in one test never collides with
