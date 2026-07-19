@@ -2,11 +2,15 @@
 SQLite database — tickets and unresolved_queries tables.
 """
 
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent.parent / "data" / "banking.db"
+# BANKING_DB_PATH lets tests point at an isolated test.db instead of the
+# real demo banking.db (see tests/conftest.py). Must be set before this
+# module is first imported — it's read once at import time.
+DB_PATH = Path(os.getenv("BANKING_DB_PATH", str(Path(__file__).parent.parent.parent / "data" / "banking.db")))
 
 
 def _conn():
